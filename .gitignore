@@ -1,0 +1,38 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Training artifacts
+weights/
+output/
+runs/
+logs/
+*.pt
+*.pth
+*.ckpt
+
+# Data and generated predictions
+blood-vessel/
+blood-vessel-patch/
+blood-vessel-diffusion-train/
+transunet_predictions/
+transunet_predictions_last/
+transunet_predictions_*/
+
+# Keep structure examples if needed
+!**/.gitkeep
