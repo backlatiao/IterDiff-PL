@@ -299,6 +299,27 @@ def hierarchical_weighted_loss(pred, target):
     edge_mask = torch.tensor(edge_mask, dtype=torch.float32).to(pred.device).unsqueeze(1)
     edge_loss = F.binary_cross_entropy(pred, edge_mask)
 
+    tp = (pred * target).sum()
+    fn = ((1 - pred) * target).sum()
+    recall = (tp + smooth) / (tp + fn + smooth)
+    recall_loss = 1 - recall
+
+    # Step6: 新增 Soft-BACC loss，直接优化 BACC
+    tn = ((1 - pred) * (1 - target)).sum()
+    fp = (pred * (1 - target)).sum()
+
+    specificity = (tn + smooth) / (tn + fp + smooth)
+    bacc = 0.5 * (recall + specificity)
+    bacc_loss = 1 - bacc
+
     # 总损失：加权融合
-    total_loss = 0.6 * dice_bce + 0.3 * hierarchical_iou + 0.1 * edge_loss
+    # total_loss = 0.6 * dice_bce + 0.3 * hierarchical_iou + 0.1 * edge_loss
+    # Step7: 总损失
+    total_loss = (
+        0.45 * dice_bce +
+        0.20 * hierarchical_iou +
+        0.10 * edge_loss +
+        0.15 * recall_loss +
+        0.10 * bacc_loss
+    )
     return total_loss
