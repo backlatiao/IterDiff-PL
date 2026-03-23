@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from model.diffusion_model import DiffusionNet, DiffusionPipeline
 
-from train.train_transunet import calculate_iou, calculate_dice
+from train_transunet import calculate_iou, calculate_dice
 
 # 鑾峰彇椤圭洰鏍圭洰褰?
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
