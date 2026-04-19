@@ -1,0 +1,12 @@
+# Python 3.10, based on the local llm conda environment.
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+torch==2.4.1+cu118
+torchvision==0.19.1+cu118
+numpy==1.24.4
+Pillow==8.4.0
+opencv-python>=4.8,<4.12
+tqdm==4.67.1
+matplotlib==3.10.8
+einops==0.8.1
+scikit-learn==1.7.2
