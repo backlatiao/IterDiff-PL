@@ -9,6 +9,7 @@ from torch import optim
 
 from model.diffusion_model import DiffusionNet, DiffusionPipeline
 from model.transunet import TransUNet
+from train_transunet import calculate_dice, calculate_iou
 
 
 class DiffusionGuidedMeanTeacher:
@@ -18,26 +19,173 @@ class DiffusionGuidedMeanTeacher:
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+        img_size = getattr(config, 'img_size', 512)
+        transunet_kwargs = dict(
+            img_size=img_size,
+            patch_size=getattr(config, 'patch_size', 16),
+            in_channels=3,
+            out_channels=1,
+            embed_dim=getattr(config, 'embed_dim', 512),
+            num_heads=getattr(config, 'num_heads', 8),
+            mlp_dim=getattr(config, 'mlp_dim', 2048),
+            num_layers=getattr(config, 'num_layers', 6),
+            features=getattr(config, 'features', [64, 128, 256, 512]),
+        )
+
         # Student 模型
-        self.student = TransUNet(...).to(self.device)
+        self.student = TransUNet(**transunet_kwargs).to(self.device)
 
         # Teacher 模型 (EMA)
-        self.teacher = TransUNet(...).to(self.device)
+        self.teacher = TransUNet(**transunet_kwargs).to(self.device)
         self.teacher.load_state_dict(self.student.state_dict())
         for param in self.teacher.parameters():
             param.requires_grad = False  # Teacher不参与梯度计算
 
         # 扩散精修器
-        self.diffusion = DiffusionNet(...).to(self.device)
+        self.diffusion = DiffusionNet(
+            img_size=img_size,
+            in_channels=5,
+            out_channels=1
+        ).to(self.device)
         self.diffusion_pipeline = DiffusionPipeline(self.diffusion, self.device)
 
         # EMA 系数
-        self.ema_decay = 0.999
+        self.ema_decay = getattr(config, 'ema_decay', 0.999)
+
+    def train(self, labeled_loader, unlabeled_loader=None, val_loader=None):
+        """完整训练入口：监督预训练 -> 扩散精修器训练 -> 半监督自训练。"""
+        self._pretrain_on_labeled(labeled_loader, val_loader)
+        self._train_diffusion(labeled_loader, val_loader)
+
+        if unlabeled_loader is not None:
+            self.train_iteration(
+                labeled_loader,
+                unlabeled_loader,
+                num_epochs=getattr(self.config, 'semi_epochs', getattr(self.config, 'epochs_per_iteration', 20))
+            )
+
+        return self.student
+
+    def _split_labeled_batch(self, batch):
+        if len(batch) >= 2:
+            return batch[0], batch[1]
+        raise ValueError("labeled_loader需要返回(images, masks, ...)格式")
+
+    def _split_unlabeled_batch(self, batch):
+        return batch[0] if isinstance(batch, (list, tuple)) else batch
+
+    def _pretrain_on_labeled(self, labeled_loader, val_loader=None):
+        """只用有标签数据预训练Student，并同步Teacher。"""
+        epochs = getattr(self.config, 'pretrain_epochs', 0)
+        if epochs <= 0:
+            return
+
+        optimizer = optim.AdamW(
+            self.student.parameters(),
+            lr=getattr(self.config, 'lr', 1e-4),
+            weight_decay=getattr(self.config, 'weight_decay', 1e-5)
+        )
+
+        for epoch in range(epochs):
+            self.student.train()
+            total_loss = 0.0
+            for batch in labeled_loader:
+                images, masks = self._split_labeled_batch(batch)
+                images, masks = images.to(self.device), masks.to(self.device)
+
+                pred = self.student(images)
+                loss = hierarchical_weighted_loss(pred, masks)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+
+            self.teacher.load_state_dict(self.student.state_dict())
+            val_iou = self._validate(val_loader or labeled_loader)
+            print(f"Pretrain [{epoch + 1}/{epochs}] loss={total_loss / len(labeled_loader):.4f}, IoU={val_iou:.4f}")
+
+    def _train_diffusion(self, labeled_loader, val_loader=None):
+        """用Teacher粗预测和GT训练扩散精修器。"""
+        epochs = getattr(self.config, 'diffusion_epochs', 0)
+        if epochs <= 0:
+            return
+
+        optimizer = optim.AdamW(
+            self.diffusion.parameters(),
+            lr=getattr(self.config, 'diffusion_lr', getattr(self.config, 'lr', 1e-4)),
+            weight_decay=getattr(self.config, 'weight_decay', 1e-5)
+        )
+        mse_loss = torch.nn.MSELoss()
+        max_refine_step = getattr(self.config, 'max_refine_step', 100)
+
+        self.teacher.eval()
+        for epoch in range(epochs):
+            self.diffusion.train()
+            total_loss = 0.0
+            for batch in labeled_loader:
+                images, masks = self._split_labeled_batch(batch)
+                images, masks = images.to(self.device), masks.to(self.device)
+
+                with torch.no_grad():
+                    coarse_pred = self.teacher(images)
+
+                timesteps = torch.randint(0, max_refine_step, (images.size(0),), device=self.device)
+                noisy_masks, noise = self.diffusion_pipeline.forward_process(coarse_pred, coarse_pred, timesteps)
+                pred_noise = self.diffusion(noisy_masks, images, coarse_pred, timesteps)
+
+                alpha_t = self.diffusion.alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+                pred_clean = (noisy_masks - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t)
+                pred_clean = pred_clean.clamp(0, 1)
+
+                loss = mse_loss(pred_noise, noise) + 0.5 * hierarchical_weighted_loss(pred_clean, masks)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+
+            val_iou = self._validate(val_loader or labeled_loader, use_diffusion=True)
+            print(f"Diffusion [{epoch + 1}/{epochs}] loss={total_loss / len(labeled_loader):.4f}, refined IoU={val_iou:.4f}")
+
+    @torch.no_grad()
+    def _validate(self, data_loader, use_diffusion=False):
+        """返回IoU；同时打印Dice，方便观察训练质量。"""
+        if data_loader is None:
+            return 0.0
+
+        self.teacher.eval()
+        self.diffusion.eval()
+        iou_list, dice_list = [], []
+
+        for batch in data_loader:
+            images, masks = self._split_labeled_batch(batch)
+            images, masks = images.to(self.device), masks.to(self.device)
+            pred = self.teacher(images)
+            if use_diffusion:
+                pred = self.diffusion_pipeline.sample(
+                    pred,
+                    images,
+                    num_inference_steps=getattr(self.config, 'num_inference_steps', 20),
+                    refine_step=getattr(self.config, 'refine_step', 80)
+                )
+            pred_bin = (pred > 0.5).float()
+            iou_list.append(calculate_iou(pred_bin, masks))
+            dice_list.append(calculate_dice(pred_bin, masks))
+
+        mean_iou = float(np.mean(iou_list)) if iou_list else 0.0
+        mean_dice = float(np.mean(dice_list)) if dice_list else 0.0
+        print(f"Validate IoU={mean_iou:.4f}, Dice={mean_dice:.4f}")
+        return mean_iou
 
     def train_iteration(self, labeled_loader, unlabeled_loader, num_epochs):
         """一轮迭代训练"""
 
-        optimizer = optim.AdamW(self.student.parameters(), lr=1e-4)
+        optimizer = optim.AdamW(
+            self.student.parameters(),
+            lr=getattr(self.config, 'lr', 1e-4),
+            weight_decay=getattr(self.config, 'weight_decay', 1e-5)
+        )
 
         # 伪标签权重从小到大（课程学习）
         lambda_schedule = np.linspace(0.1, 1.0, num_epochs)
@@ -53,10 +201,11 @@ class DiffusionGuidedMeanTeacher:
 
                 # ========== 有标签数据：监督损失 ==========
                 try:
-                    images_l, masks_l = next(labeled_iter)
+                    batch_l = next(labeled_iter)
                 except StopIteration:
                     labeled_iter = iter(labeled_loader)
-                    images_l, masks_l = next(labeled_iter)
+                    batch_l = next(labeled_iter)
+                images_l, masks_l = self._split_labeled_batch(batch_l)
 
                 images_l, masks_l = images_l.to(self.device), masks_l.to(self.device)
 
@@ -66,10 +215,11 @@ class DiffusionGuidedMeanTeacher:
 
                 # ========== 无标签数据：伪标签损失 ==========
                 try:
-                    images_u, _ = next(unlabeled_iter)
+                    batch_u = next(unlabeled_iter)
                 except StopIteration:
                     unlabeled_iter = iter(unlabeled_loader)
-                    images_u, _ = next(unlabeled_iter)
+                    batch_u = next(unlabeled_iter)
+                images_u = self._split_unlabeled_batch(batch_u)
 
                 images_u = images_u.to(self.device)
 
@@ -79,11 +229,13 @@ class DiffusionGuidedMeanTeacher:
 
                 # 扩散模型 K 次采样
                 soft_label, uncertainty = self._diffusion_ensemble(
-                    images_u, coarse_pred, K=self.config.K
+                    images_u, coarse_pred, K=getattr(self.config, 'K', 4),
+                    refine_step=getattr(self.config, 'refine_step', 80),
+                    num_inference_steps=getattr(self.config, 'num_inference_steps', 20)
                 )
 
                 # 不确定性加权
-                confidence_weight = torch.exp(-self.config.gamma * uncertainty)
+                confidence_weight = torch.exp(-getattr(self.config, 'gamma', 4.0) * uncertainty)
 
                 # Student 预测
                 pred_u = self.student(images_u)
@@ -121,10 +273,12 @@ class DiffusionGuidedMeanTeacher:
             print(f"Epoch [{epoch + 1}/{num_epochs}] "
                   f"L_sup: {loss_sup:.4f}, L_pl: {loss_pl:.4f}")
 
+    @staticmethod
     def _bernoulli_entropy(p, eps=1e-6):
         p = p.clamp(eps, 1 - eps)
         return -(p * torch.log(p) + (1 - p) * torch.log(1 - p))
 
+    @torch.no_grad()
     def _diffusion_ensemble(self, images, coarse_pred, K=4, refine_step=80, num_inference_steps=20, seed_base=12345):
         """扩散模型 K 次采样，返回软标签和不确定性"""
         self.teacher.eval()
@@ -292,7 +446,11 @@ def hierarchical_weighted_loss(pred, target):
 
     # Step4: 边缘损失（优化血管边缘）
     # 生成边缘掩码（Canny）
-    target_np = target.cpu().detach().numpy().squeeze()
+    target_np = target.cpu().detach().numpy()
+    if target_np.ndim == 4:
+        target_np = target_np[:, 0]
+    elif target_np.ndim == 2:
+        target_np = target_np[None, ...]
     edge_mask = np.zeros_like(target_np)
     for i in range(target_np.shape[0]):
         edge_mask[i] = cv2.Canny((target_np[i]*255).astype(np.uint8), 50, 150) / 255
