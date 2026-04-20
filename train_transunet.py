@@ -334,7 +334,7 @@ def main():
     # 超参数设置
     batch_size = 4  # 根据GPU内存调整
     learning_rate = 1e-4
-    num_epochs = 50
+    num_epochs = 100
     img_size = 512
     
     # 创建数据集和数据加载器

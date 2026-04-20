@@ -15,7 +15,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from model.diffusion_model import DiffusionNet, DiffusionPipeline
+from model.diffusion_model_v2 import DiffusionNet, DiffusionPipeline
 
 
 def split_image_to_patches(image, cols=4, rows=4):

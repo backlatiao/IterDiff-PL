@@ -14,7 +14,7 @@ import sys
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from datetime import datetime
-from model.diffusion_model import DiffusionNet, DiffusionPipeline
+from model.diffusion_model_v2 import DiffusionNet, DiffusionPipeline
 
 from train_transunet import calculate_iou, calculate_dice
 
@@ -245,7 +245,7 @@ def train_diffusion_model(resume_from_checkpoint=None, use_mixed_data=False):
         return
     
     # 超参数设置
-    batch_size = 1
+    batch_size = 2
     learning_rate = 4e-5  # 降低学习率，精细化任务需要更温和的优化
     num_epochs = 500
     img_size = 512
@@ -748,4 +748,3 @@ if __name__ == "__main__":
         
     else:
         print("无效选择")
-

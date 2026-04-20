@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import optim
 
-from model.diffusion_model import DiffusionNet, DiffusionPipeline
+from model.diffusion_model_v2 import DiffusionNet, DiffusionPipeline
 from model.transunet import TransUNet
 from train_transunet import calculate_dice, calculate_iou
 
