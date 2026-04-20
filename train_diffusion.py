@@ -16,10 +16,21 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from model.diffusion_model_v2 import DiffusionNet, DiffusionPipeline
 
-from train_transunet import calculate_iou, calculate_dice
+from train_transunet import calculate_iou, calculate_dice, calculate_bacc, calculate_cldice
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+DEFAULT_REFINEMENT_CURRICULUM = (30, 60, 90)
+
+
+def get_curriculum_refine_step(epoch, num_epochs, schedule=DEFAULT_REFINEMENT_CURRICULUM):
+    """Return the active refinement step for a coarse-to-fine curriculum."""
+    if not schedule:
+        return 100
+    stage_len = max(1, int(np.ceil(num_epochs / len(schedule))))
+    stage_idx = min(epoch // stage_len, len(schedule) - 1)
+    return int(schedule[stage_idx])
 
 
 def calculate_sensitivity(preds, targets, smooth=1e-6):
@@ -249,7 +260,7 @@ def train_diffusion_model(resume_from_checkpoint=None, use_mixed_data=False):
     learning_rate = 4e-5  # 降低学习率，精细化任务需要更温和的优化
     num_epochs = 500
     img_size = 512
-    max_refine_step = 100  # 降低到100，从更小的噪声开始，保留更多TransUNet结构
+    refine_step_schedule = DEFAULT_REFINEMENT_CURRICULUM
     patience = 50  # 增加早停耐心
     start_epoch = 0  # 起始epoch
     
@@ -343,9 +354,10 @@ def train_diffusion_model(resume_from_checkpoint=None, use_mixed_data=False):
     
     print("开始训练扩散模型...")
     for epoch in range(start_epoch, num_epochs):
+        current_refine_step = get_curriculum_refine_step(epoch, num_epochs, refine_step_schedule)
         diffusion_model.train()
         train_loss = 0.0
-        train_bar = tqdm(train_loader, desc=f'Epoch [{epoch+1}/{num_epochs}] Train')
+        train_bar = tqdm(train_loader, desc=f'Epoch [{epoch+1}/{num_epochs}] Train t0={current_refine_step}')
         
         for images, true_masks, transunet_preds, _ in train_bar:
             images = images.to(device)
@@ -356,8 +368,8 @@ def train_diffusion_model(resume_from_checkpoint=None, use_mixed_data=False):
             # 这样训练和推理的分布就一致了，消除domain gap
             clean_start = transunet_preds
             
-            # 让模型专注学习[0, max_refine_step] 范围内的去噪，与测试时的 refine_step 对齐
-            timesteps = torch.randint(0, max_refine_step, (images.size(0),)).to(device)
+            # Curriculum: early epochs use mild noise, later epochs refine stronger local degradation.
+            timesteps = torch.randint(0, current_refine_step + 1, (images.size(0),)).to(device)
             
             # 为TransUNet预测添加噪声（而不是为GT添加噪声）
             noisy_target_masks, noise = diffusion_pipeline.forward_process(
@@ -423,8 +435,9 @@ def train_diffusion_model(resume_from_checkpoint=None, use_mixed_data=False):
                 transunet_iou = calculate_iou(initial_pred_bin, true_mask)  # train.py的函数已经返回item()
                 transunet_iou_list.append(transunet_iou)
                 
-                # refine_step 必须在训练范围内，且与max_refine_step一致
-                refined_mask = diffusion_pipeline.sample(transunet_pred, image, num_inference_steps=10, refine_step=max_refine_step)
+                refined_mask = diffusion_pipeline.sample(
+                    transunet_pred, image, num_inference_steps=10, refine_step=current_refine_step
+                )
                 # 二值化后计算IoU
                 refined_mask_bin = (refined_mask > 0.5).float()
                 iou = calculate_iou(refined_mask_bin, true_mask)  # train.py的函数已经返回item()
@@ -433,7 +446,9 @@ def train_diffusion_model(resume_from_checkpoint=None, use_mixed_data=False):
         avg_val_iou = np.mean(val_iou_list)
         avg_transunet_iou = np.mean(transunet_iou_list)
         improvement = avg_val_iou - avg_transunet_iou
-        print(f'Epoch [{epoch+1}/{num_epochs}] Train Loss: {avg_train_loss:.6f}, TransUNet IoU: {avg_transunet_iou:.4f}, Refined IoU: {avg_val_iou:.4f}, 提升: {improvement:+.4f}')
+        print(f'Epoch [{epoch+1}/{num_epochs}] Train Loss: {avg_train_loss:.6f}, '
+              f't0: {current_refine_step}, TransUNet IoU: {avg_transunet_iou:.4f}, '
+              f'Refined IoU: {avg_val_iou:.4f}, 提升: {improvement:+.4f}')
         
         # 更新学习率调度器
         scheduler.step(avg_val_iou)
@@ -561,7 +576,7 @@ def test_diffusion_model(custom_pred_dir=None, custom_data_dir=None):
     print(f"测试集样本数: {len(test_dataset)}")
     
     metrics = {
-        'iou': [], 'dice': [], 'precision': [], 'sensitivity': [], 
+        'iou': [], 'dice': [], 'cldice': [], 'bacc': [], 'precision': [], 'sensitivity': [],
         'specificity': [], 'accuracy': [], 'auc_roc': [], 'auc_pr': []
     }
     
@@ -572,9 +587,12 @@ def test_diffusion_model(custom_pred_dir=None, custom_data_dir=None):
             true_masks = true_masks.to(device)
             transunet_preds = transunet_preds.to(device)
             
-            # 扩散精细化：使用改进后的采样逻辑
-            # refine_step 设置为100，与训练时的max_refine_step对齐
-            refined_result = diffusion_pipeline.sample(transunet_preds, images, num_inference_steps=20, refine_step=100)
+            refined_result = diffusion_pipeline.sample(
+                transunet_preds,
+                images,
+                num_inference_steps=20,
+                refine_step=DEFAULT_REFINEMENT_CURRICULUM[-1],
+            )
             
             # 保留连续值用于计算AUC
             refined_result_prob = refined_result.clone()
@@ -583,6 +601,8 @@ def test_diffusion_model(custom_pred_dir=None, custom_data_dir=None):
             refined_result_bin = (refined_result > 0.5).float()
             metrics['iou'].append(calculate_iou(refined_result_bin, true_masks))  # 已经是item()
             metrics['dice'].append(calculate_dice(refined_result_bin, true_masks))  # 已经是item()
+            metrics['cldice'].append(calculate_cldice(refined_result_bin, true_masks))
+            metrics['bacc'].append(calculate_bacc(refined_result_bin, true_masks))
             metrics['precision'].append(calculate_precision(refined_result_bin, true_masks).item())
             metrics['sensitivity'].append(calculate_sensitivity(refined_result_bin, true_masks).item())
             metrics['specificity'].append(calculate_specificity(refined_result_bin, true_masks).item())
@@ -598,6 +618,8 @@ def test_diffusion_model(custom_pred_dir=None, custom_data_dir=None):
     print("="*60)
     print(f"IoU (Intersection over Union):     {np.mean(metrics['iou']):.4f}")
     print(f"Dice 系数 (Dice Coefficient):      {np.mean(metrics['dice']):.4f}")
+    print(f"clDice:                            {np.mean(metrics['cldice']):.4f}")
+    print(f"BACC (Balanced Accuracy):          {np.mean(metrics['bacc']):.4f}")
     print(f"精确率(Precision):                {np.mean(metrics['precision']):.4f}")
     print(f"敏感度/召回率(Sensitivity/Recall): {np.mean(metrics['sensitivity']):.4f}")
     print(f"特异度(Specificity):              {np.mean(metrics['specificity']):.4f}")
@@ -649,7 +671,12 @@ def visualize_diffusion_results(diffusion_pipeline, test_loader, device, num_sam
             transunet_pred_bin = (transunet_pred_tensor > 0.5).float().squeeze().cpu().numpy()
             
             # 扩散模型精细化
-            refined_pred = diffusion_pipeline.sample(transunet_pred_tensor, image_tensor, num_inference_steps=20, refine_step=100)
+            refined_pred = diffusion_pipeline.sample(
+                transunet_pred_tensor,
+                image_tensor,
+                num_inference_steps=20,
+                refine_step=DEFAULT_REFINEMENT_CURRICULUM[-1],
+            )
             refined_pred_bin = (refined_pred > 0.5).float().squeeze().cpu().numpy()
             
             # 处理图像用于显示

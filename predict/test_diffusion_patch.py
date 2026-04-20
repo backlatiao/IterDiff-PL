@@ -151,7 +151,7 @@ def test_diffusion_model_with_patches(
                     pred_tensor,
                     img_tensor,
                     num_inference_steps=20,
-                    refine_step=100,
+                    refine_step=90,
                 )
 
                 # 将512x512结果resize回原patch尺寸

@@ -9,7 +9,7 @@ from torch import optim
 
 from model.diffusion_model_v2 import DiffusionNet, DiffusionPipeline
 from model.transunet import TransUNet
-from train_transunet import calculate_dice, calculate_iou
+from train_transunet import calculate_bacc, calculate_cldice, calculate_dice, calculate_iou
 
 
 class DiffusionGuidedMeanTeacher:
@@ -51,6 +51,17 @@ class DiffusionGuidedMeanTeacher:
 
         # EMA 系数
         self.ema_decay = getattr(config, 'ema_decay', 0.999)
+
+    def _refine_step_schedule(self):
+        return getattr(self.config, 'refine_step_schedule', [30, 60, 90])
+
+    def _curriculum_refine_step(self, epoch, num_epochs):
+        schedule = self._refine_step_schedule()
+        if not schedule:
+            return getattr(self.config, 'refine_step', 90)
+        stage_len = max(1, int(np.ceil(num_epochs / len(schedule))))
+        stage_idx = min(epoch // stage_len, len(schedule) - 1)
+        return int(schedule[stage_idx])
 
     def train(self, labeled_loader, unlabeled_loader=None, val_loader=None):
         """完整训练入口：监督预训练 -> 扩散精修器训练 -> 半监督自训练。"""
@@ -117,10 +128,9 @@ class DiffusionGuidedMeanTeacher:
             weight_decay=getattr(self.config, 'weight_decay', 1e-5)
         )
         mse_loss = torch.nn.MSELoss()
-        max_refine_step = getattr(self.config, 'max_refine_step', 100)
-
         self.teacher.eval()
         for epoch in range(epochs):
+            current_refine_step = self._curriculum_refine_step(epoch, epochs)
             self.diffusion.train()
             total_loss = 0.0
             for batch in labeled_loader:
@@ -130,7 +140,7 @@ class DiffusionGuidedMeanTeacher:
                 with torch.no_grad():
                     coarse_pred = self.teacher(images)
 
-                timesteps = torch.randint(0, max_refine_step, (images.size(0),), device=self.device)
+                timesteps = torch.randint(0, current_refine_step + 1, (images.size(0),), device=self.device)
                 noisy_masks, noise = self.diffusion_pipeline.forward_process(coarse_pred, coarse_pred, timesteps)
                 pred_noise = self.diffusion(noisy_masks, images, coarse_pred, timesteps)
 
@@ -145,18 +155,25 @@ class DiffusionGuidedMeanTeacher:
                 optimizer.step()
                 total_loss += loss.item()
 
-            val_iou = self._validate(val_loader or labeled_loader, use_diffusion=True)
-            print(f"Diffusion [{epoch + 1}/{epochs}] loss={total_loss / len(labeled_loader):.4f}, refined IoU={val_iou:.4f}")
+            val_iou = self._validate(
+                val_loader or labeled_loader,
+                use_diffusion=True,
+                refine_step=current_refine_step,
+            )
+            print(f"Diffusion [{epoch + 1}/{epochs}] t0={current_refine_step} "
+                  f"loss={total_loss / len(labeled_loader):.4f}, refined IoU={val_iou:.4f}")
 
     @torch.no_grad()
-    def _validate(self, data_loader, use_diffusion=False):
-        """返回IoU；同时打印Dice，方便观察训练质量。"""
+    def _validate(self, data_loader, use_diffusion=False, refine_step=None):
+        """返回IoU；同时打印Dice、BACC和clDice，方便观察训练质量。"""
         if data_loader is None:
             return 0.0
 
         self.teacher.eval()
         self.diffusion.eval()
-        iou_list, dice_list = [], []
+        iou_list, dice_list, bacc_list, cldice_list = [], [], [], []
+        if refine_step is None:
+            refine_step = self._refine_step_schedule()[-1]
 
         for batch in data_loader:
             images, masks = self._split_labeled_batch(batch)
@@ -167,15 +184,20 @@ class DiffusionGuidedMeanTeacher:
                     pred,
                     images,
                     num_inference_steps=getattr(self.config, 'num_inference_steps', 20),
-                    refine_step=getattr(self.config, 'refine_step', 80)
+                    refine_step=refine_step
                 )
             pred_bin = (pred > 0.5).float()
             iou_list.append(calculate_iou(pred_bin, masks))
             dice_list.append(calculate_dice(pred_bin, masks))
+            bacc_list.append(calculate_bacc(pred_bin, masks))
+            cldice_list.append(calculate_cldice(pred_bin, masks))
 
         mean_iou = float(np.mean(iou_list)) if iou_list else 0.0
         mean_dice = float(np.mean(dice_list)) if dice_list else 0.0
-        print(f"Validate IoU={mean_iou:.4f}, Dice={mean_dice:.4f}")
+        mean_bacc = float(np.mean(bacc_list)) if bacc_list else 0.0
+        mean_cldice = float(np.mean(cldice_list)) if cldice_list else 0.0
+        print(f"Validate IoU={mean_iou:.4f}, Dice={mean_dice:.4f}, "
+              f"BACC={mean_bacc:.4f}, clDice={mean_cldice:.4f}")
         return mean_iou
 
     def train_iteration(self, labeled_loader, unlabeled_loader, num_epochs):
@@ -191,6 +213,7 @@ class DiffusionGuidedMeanTeacher:
         lambda_schedule = np.linspace(0.1, 1.0, num_epochs)
 
         for epoch in range(num_epochs):
+            current_refine_step = self._curriculum_refine_step(epoch, num_epochs)
             self.student.train()
 
             # 同时遍历有标签和无标签数据
@@ -230,7 +253,7 @@ class DiffusionGuidedMeanTeacher:
                 # 扩散模型 K 次采样
                 soft_label, uncertainty = self._diffusion_ensemble(
                     images_u, coarse_pred, K=getattr(self.config, 'K', 4),
-                    refine_step=getattr(self.config, 'refine_step', 80),
+                    refine_step=current_refine_step,
                     num_inference_steps=getattr(self.config, 'num_inference_steps', 20)
                 )
 
@@ -270,7 +293,7 @@ class DiffusionGuidedMeanTeacher:
                 # ========== EMA 更新 Teacher ==========
                 self._update_ema_teacher()
 
-            print(f"Epoch [{epoch + 1}/{num_epochs}] "
+            print(f"Epoch [{epoch + 1}/{num_epochs}] t0={current_refine_step} "
                   f"L_sup: {loss_sup:.4f}, L_pl: {loss_pl:.4f}")
 
     @staticmethod
@@ -279,7 +302,7 @@ class DiffusionGuidedMeanTeacher:
         return -(p * torch.log(p) + (1 - p) * torch.log(1 - p))
 
     @torch.no_grad()
-    def _diffusion_ensemble(self, images, coarse_pred, K=4, refine_step=80, num_inference_steps=20, seed_base=12345):
+    def _diffusion_ensemble(self, images, coarse_pred, K=4, refine_step=90, num_inference_steps=20, seed_base=12345):
         """扩散模型 K 次采样，返回软标签和不确定性"""
         self.teacher.eval()
         self.diffusion.eval()
@@ -307,7 +330,7 @@ class DiffusionGuidedMeanTeacher:
         return soft_label, uncertainty
 
     @torch.no_grad()
-    def diffusion_ensemble(self, images_u, coarse_pred, K=4, refine_step=80, num_inference_steps=20, seed_base=12345):
+    def diffusion_ensemble(self, images_u, coarse_pred, K=4, refine_step=90, num_inference_steps=20, seed_base=12345):
         """
         images_u: (B,3,H,W)
         coarse_pred: (B,1,H,W)  # teacher 输出概率mask

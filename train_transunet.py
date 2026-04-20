@@ -2,6 +2,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
@@ -207,6 +208,73 @@ def calculate_dice(preds, targets):
     dice = (2. * intersection + smooth) / (preds.sum() + targets.sum() + smooth)
     return dice.item()
 
+
+def calculate_bacc(preds, targets):
+    smooth = 1e-6
+    preds = preds.view(-1)
+    targets = targets.view(-1)
+
+    tp = (preds * targets).sum()
+    fn = ((1 - preds) * targets).sum()
+    tn = ((1 - preds) * (1 - targets)).sum()
+    fp = (preds * (1 - targets)).sum()
+
+    sensitivity = (tp + smooth) / (tp + fn + smooth)
+    specificity = (tn + smooth) / (tn + fp + smooth)
+    return (0.5 * (sensitivity + specificity)).item()
+
+
+def _to_4d_mask(mask):
+    if mask.dim() == 2:
+        return mask.unsqueeze(0).unsqueeze(0)
+    if mask.dim() == 3:
+        return mask.unsqueeze(1)
+    return mask
+
+
+def _soft_erode(mask):
+    eroded_h = -F.max_pool2d(-mask, kernel_size=(3, 1), stride=1, padding=(1, 0))
+    eroded_w = -F.max_pool2d(-mask, kernel_size=(1, 3), stride=1, padding=(0, 1))
+    return torch.min(eroded_h, eroded_w)
+
+
+def _soft_dilate(mask):
+    return F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
+
+
+def _soft_open(mask):
+    return _soft_dilate(_soft_erode(mask))
+
+
+def _soft_skeleton(mask, num_iter=10):
+    mask = mask.float()
+    opened = _soft_open(mask)
+    skeleton = F.relu(mask - opened)
+
+    for _ in range(num_iter):
+        mask = _soft_erode(mask)
+        opened = _soft_open(mask)
+        delta = F.relu(mask - opened)
+        skeleton = skeleton + F.relu(delta - skeleton * delta)
+
+    return skeleton
+
+
+def calculate_cldice(preds, targets, num_iter=10):
+    smooth = 1e-6
+    preds = _to_4d_mask(preds.float())
+    targets = _to_4d_mask(targets.float())
+
+    pred_skeleton = _soft_skeleton(preds, num_iter=num_iter)
+    target_skeleton = _soft_skeleton(targets, num_iter=num_iter)
+
+    topology_precision = (pred_skeleton * targets).sum() / (pred_skeleton.sum() + smooth)
+    topology_sensitivity = (target_skeleton * preds).sum() / (target_skeleton.sum() + smooth)
+    cldice = (2 * topology_precision * topology_sensitivity) / (
+        topology_precision + topology_sensitivity + smooth
+    )
+    return cldice.item()
+
 # 可视化训练历史
 def plot_training_history(history):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
@@ -298,6 +366,8 @@ def evaluate_model(model, test_loader):
     model.eval()
     total_iou = 0.0
     total_dice = 0.0
+    total_bacc = 0.0
+    total_cldice = 0.0
     total_samples = 0
     
     test_bar = tqdm(test_loader, desc='Testing')
@@ -315,19 +385,29 @@ def evaluate_model(model, test_loader):
             
             batch_dice = calculate_dice(preds, masks)
             total_dice += batch_dice * images.size(0)
+
+            batch_bacc = calculate_bacc(preds, masks)
+            total_bacc += batch_bacc * images.size(0)
+
+            batch_cldice = calculate_cldice(preds, masks)
+            total_cldice += batch_cldice * images.size(0)
             
             total_samples += images.size(0)
             
-            test_bar.set_postfix(iou=batch_iou, dice=batch_dice)
+            test_bar.set_postfix(iou=batch_iou, dice=batch_dice, bacc=batch_bacc, cldice=batch_cldice)
     
     mean_iou = total_iou / total_samples
     mean_dice = total_dice / total_samples
+    mean_bacc = total_bacc / total_samples
+    mean_cldice = total_cldice / total_samples
     
     print(f"测试集评估结果:")
     print(f"平均IoU: {mean_iou:.4f}")
     print(f"平均Dice系数: {mean_dice:.4f}")
+    print(f"平均BACC: {mean_bacc:.4f}")
+    print(f"平均clDice: {mean_cldice:.4f}")
     
-    return mean_iou, mean_dice
+    return mean_iou, mean_dice, mean_bacc, mean_cldice
 
 # 主函数
 def main():
@@ -382,7 +462,7 @@ def main():
     
     # 在测试集上评估模型
     print("在测试集上评估模型...")
-    mean_iou, mean_dice = evaluate_model(model, test_loader)
+    mean_iou, mean_dice, mean_bacc, mean_cldice = evaluate_model(model, test_loader)
     
     # 可视化预测结果
     print("可视化预测结果...")
